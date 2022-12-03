@@ -1,0 +1,154 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Globals:
+  Function:
+    Runtime: python3.9
+    Timeout: 30
+    MemorySize: 2048
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        STAGE: !FindInMap [EnvMap, !Ref Env, Stage]
+        FLASK_APP_ENV: !FindInMap [EnvMap, !Ref Env, FlaskAppEnv]
+        LOG_LEVEL: !FindInMap [EnvMap, !Ref Env, LogLevel]
+  Api:
+    OpenApiVersion: 3.0.2 # Stageにデプロイされないための設定
+    EndpointConfiguration: EDGE
+    Cors:
+      AllowMethods: "'DELETE,GET,OPTIONS,POST,PUT'"
+      AllowHeaders: "'Content-Type,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+      AllowOrigin: !FindInMap [EnvMap, !Ref Env, AllowOrigin]
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues:
+      - dev
+    Default: dev
+
+Mappings:
+  EnvMap:
+    # dev環境
+    dev:
+      Stage: "dev"
+      ApiStageName: "dev"
+      LogLevel: "DEBUG"
+      ApiName: "NTI-VWR-APIGW01"
+      FlaskAppEnv: "development"
+      LambdaFunctionName: "NtiVwrBackendFunction"
+      LambdaRole: "NtiVwrLambdaRole"
+      AllowOrigin: "'*'"
+Resources:
+  VWRApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub
+        - ${ApiName}
+        - { ApiName: !FindInMap [EnvMap, !Ref Env, ApiName] }
+      StageName: !FindInMap [EnvMap, !Ref Env, ApiStageName]
+      TracingEnabled: true
+      DefinitionBody:
+        openapi: 3.0.2
+        info:
+          title: "virtual waiting room api"
+          version: "1.0"
+        schemes:
+          - https
+        paths:
+          /{proxy+}:
+            x-amazon-apigateway-any-method:
+              security:
+                - api-key: []
+              x-amazon-apigateway-integration:
+                uri:
+                  !Join [
+                      "",
+                    [
+                        "arn:aws:apigateway:ap-northeast-1:lambda:path/2015-03-31/functions/",
+                        !GetAtt VWRBackendFunction.Arn,
+                        "/invocations",
+                    ],
+                  ]
+                responses:
+                  default:
+                    statusCode: "200"
+                passthroughBehavior: "when_no_match"
+                httpMethod: "POST"
+                contentHandling: "CONVERT_TO_TEXT"
+                type: "aws_proxy"
+        components:
+          securitySchemes:
+            api-key: # 任意の名称。API Gatewayのキーを設定
+              type: "apiKey"
+              name: "x-api-key"
+              in: "header"
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: # 依存関係
+      - VWRApi
+      - VWRApiStage  # この論理IDはテンプレート内で明示的に作成していないが、AWS::Serverless::Api リソースによって「{API名}Stage」の名前で作成される。
+      - ApiUsagePlan
+    Properties:
+      Name: !Sub
+        - ${ApiName}-api-key
+        - { ApiName: !FindInMap [ EnvMap, !Ref Env, ApiName ] }
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref VWRApi
+          StageName: !FindInMap [ EnvMap, !Ref Env, ApiStageName ]
+
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn:
+      - VWRApi
+      - VWRApiStage
+    Properties:
+      ApiStages:
+        - ApiId: !Ref VWRApi
+          Stage: !FindInMap [ EnvMap, !Ref Env, ApiStageName ]
+      Throttle:
+        BurstLimit: 200  # バーストとして許容されるリクエスト数
+        RateLimit: 100  # API 一定リクエスト率の制限 (長期間にわたる 1 秒あたりのリクエストの平均)
+      UsagePlanName: !Sub
+        - ${ApiName}-api-usage-plan
+        - { ApiName: !FindInMap [ EnvMap, !Ref Env, ApiName ] }
+
+  ApiUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    DependsOn:
+      - VWRApi
+      - VWRApiStage
+      - ApiUsagePlan
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiUsagePlan
+
+  VWRBackendFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !FindInMap [EnvMap, !Ref Env, LambdaFunctionName]
+      CodeUri: src/
+      Handler: app.lambda_handler
+      Role: !Sub
+        - arn:aws:iam::${AWS::AccountId}:role/${LambdaRole}
+        - { LambdaRole: !FindInMap [ EnvMap, !Ref Env, LambdaRole ] }
+      Events:
+        ANYProxy:
+          Type: Api
+          Properties:
+            Path: "/{proxy+}"
+            Method: ANY
+            RestApiId: !Ref VWRApi
+            Auth:
+              ApiKeyRequired: true
+
+  LambdaPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref VWRBackendFunction
+      Principal: apigateway.amazonaws.com
