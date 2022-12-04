@@ -50,3 +50,6 @@ Thumbs.db
 
 # sam build
 .aws-sam
+
+# venv
+.venv

@@ -21,7 +21,6 @@ freezegun = "*"
 
 [scripts]
 start = "python src/app.py"
-test = "./scripts/test.sh"
 
 [requires]
 python_version = "3.9"
